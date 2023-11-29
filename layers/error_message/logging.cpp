@@ -27,6 +27,8 @@
 #include "generated/vk_validation_error_messages.h"
 #include "error_location.h"
 #include "utils/hash_util.h"
+#include <stdio.h>
+#include <unistd.h>
 
 [[maybe_unused]] const char *kVUIDUndefined = "VUID_Undefined";
 
@@ -353,6 +355,53 @@ static bool LogMsgEnabled(const debug_report_data *debug_data, std::string_view 
     return true;
 }
 
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+// get android stack with debuggerd utilite
+std::string GetAndroidStacktrace() {
+    const char* FAIL_MESSAGE = "Failed to get backtrace";
+    pthread_t tid = gettid();
+    // get debuggerd output
+    char cmd[32]={0};
+    if (snprintf(cmd, sizeof(cmd), "debuggerd -b %ld", tid) <= 0) {
+        assert(false);
+        return FAIL_MESSAGE;
+    }
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd, "r"), pclose);
+    // output looks like blocks with, split py mepty lines
+    // <thread name>> sysTid=<tid>
+    // #00 pc 0000000000202438  /system/bin/surfaceflinger 
+    // #01 pc 0000000000202438  /system/bin/surfaceflinger 
+    // ....
+    // #n pc 0000000000202438  /system/bin/surfaceflinger 
+    //
+    // so, we are looking for a block that starts with sysTid=<tid>
+    char pattern[32]={0};
+    if (snprintf(pattern, sizeof(pattern), "sysTid=%ld", tid) <= 0) {
+        assert(false);
+        return FAIL_MESSAGE;
+    }
+    std::string result;
+    bool relevant_block=false;
+
+    char buffer[1024]={0};
+    while(fgets(buffer, sizeof(buffer), pipe.get()) != nullptr) {
+        if (relevant_block) {
+            // new block started
+            if (strstr(buffer, "sysTid=") != nullptr) {
+                return result;
+            }
+        } else {
+            relevant_block = strstr(buffer, pattern) != nullptr;
+        }
+        // add new line
+        if (relevant_block) {
+            result.append(buffer);
+        }
+    }
+    return result;
+}
+#endif
+
 VKAPI_ATTR bool LogMsg(const debug_report_data *debug_data, VkFlags msg_flags, const LogObjectList &objects, const Location *loc,
                        std::string_view vuid_text, const char *format, va_list argptr) {
     assert(*(vuid_text.data() + vuid_text.size()) == '\0');
@@ -403,7 +452,11 @@ VKAPI_ATTR bool LogMsg(const debug_report_data *debug_data, VkFlags msg_flags, c
     if (loc) {
         str_plus_spec_text = loc->Message() + " " + str_plus_spec_text;
     }
-
+    // Append stacktrace
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+    std::string android_stacktrace = GetAndroidStacktrace();
+    str_plus_spec_text.append("Backtrace:\n" + android_stacktrace);
+#endif
     // Append the spec error text to the error message, unless it contains a word treated as special
     if ((vuid_text.find("UNASSIGNED-") == std::string::npos) && (vuid_text.find(kVUIDUndefined) == std::string::npos) &&
         (vuid_text.rfind("SYNC-", 0) == std::string::npos) && (vuid_text.find("INTERNAL-ERROR-") == std::string::npos)) {
@@ -505,7 +558,31 @@ VKAPI_ATTR VkBool32 VKAPI_CALL MessengerLogCallback(VkDebugUtilsMessageSeverityF
     fflush((FILE *)user_data);
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
-    LOGCONSOLE("%s", cstr);
+   // there's a truncation in logs, so, we'll log by chunks not to loose anything
+    size_t idx = 0;
+    size_t chunk_start = 0;
+    size_t MAX_LOG_MSG_LEN = 1023;
+    do {
+        size_t next = tmp.find('\n', idx);
+        if (next == std::string::npos) {
+            next = tmp.size();
+        }
+        if (next - chunk_start > MAX_LOG_MSG_LEN ) {
+            // flush previous if there's something to flush
+            if (idx != chunk_start) {
+                LOGCONSOLE("%s", tmp.substr(chunk_start, idx - chunk_start).c_str());
+                chunk_start = idx;
+            }
+            // flush long line by chunks also
+            if (next - chunk_start > MAX_LOG_MSG_LEN) {
+                for (size_t i = chunk_start; i < next; i += MAX_LOG_MSG_LEN) {
+                    LOGCONSOLE("%s", tmp.substr(i, std::min(MAX_LOG_MSG_LEN, next - i)).c_str());
+                }
+                chunk_start = next + 1;
+            }
+        }
+        idx = next + 1;
+    } while(idx < tmp.size());
 #endif
 
     return false;
